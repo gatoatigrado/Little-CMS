@@ -28,6 +28,8 @@
 #include <iostream>
 #include <memory>
 #include <vector>
+#include <immintrin.h>
+#include <lcms2_plugin.h>
 
 extern "C" {
 #include "lcms2_internal.h"
@@ -386,7 +388,7 @@ void NullXFORM(_cmsTRANSFORM* p,
 }
 
 constexpr size_t kFasterStageBatchSize = 128;
-using ChannelBatchBuffer = float[kFasterStageBatchSize];
+using ChannelBatchBuffer = __attribute__((aligned(32))) float[kFasterStageBatchSize];
 
 /** Basic API for faster stages */
 class FasterStage {
@@ -429,11 +431,63 @@ public:
 
         for (size_t i = 0; i < curvesData->nCurves; i++) {
             cmsToneCurve *const curve = curvesData->TheCurves[i];
+            _cmsAssert(curve != NULL);
             const ChannelBatchBuffer &in = input_buffer[i];
             ChannelBatchBuffer &out = output_buffer_[i];
-            for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
-                out[batchIdx] = cmsEvalToneCurveFloat(curve, in[batchIdx]);
+
+            if (curve->nSegments == 0) {
+                batchEvaluateLimitedPrecision(curve, in, &out);
+            } else {
+                for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+                    out[batchIdx] = cmsEvalToneCurveFloat(curve, in[batchIdx]);
+                }
             }
+        }
+    }
+
+private:
+    static __m256 avxSaturate(register __m256 input) {
+        input = _mm256_set1_ps(65535.0) * input + _mm256_set1_ps(0.5);
+        return _mm256_floor_ps(
+                _mm256_min_ps(_mm256_set1_ps(665535.0),
+                              _mm256_max_ps(_mm256_set1_ps(0.0), input)));
+    }
+
+    static __m256 avxUnpack(register __m256i epi32_input) {
+        return _mm256_mul_ps( _mm256_set1_ps(1.0f / 65535.0f), _mm256_cvtepi32_ps(epi32_input));
+    }
+
+    void batchEvaluateLimitedPrecision(
+            const cmsToneCurve *curve, const ChannelBatchBuffer in,
+            ChannelBatchBuffer *out) const {
+        cmsUInt16Number inBuffer[kFasterStageBatchSize];
+        cmsUInt16Number outBuffer[kFasterStageBatchSize];
+
+        // Convert everything to uint16 using AVX.
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; batchIdx += 16) {
+            __m256 input1 = avxSaturate(_mm256_loadu_ps(&in[batchIdx]));
+            __m256 input2 = avxSaturate(_mm256_loadu_ps(&in[batchIdx + 8]));
+            __m256i packed = _mm256_packus_epi32(
+                    _mm256_cvtps_epi32(input1),
+                    _mm256_cvtps_epi32(input2));
+            _mm256_storeu_si256(
+                    reinterpret_cast<__m256i *>(&inBuffer[batchIdx]),
+                    packed);
+        }
+
+        _cmsInterpFn16 curveFcn = curve->InterpParams->Interpolation.Lerp16;
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+            // Check for 16 bits table. If so, this is a limited-precision tone curve
+            curveFcn(&inBuffer[batchIdx], &outBuffer[batchIdx], curve->InterpParams);
+        }
+
+        // Convert back to float using AVX.
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; batchIdx += 16) {
+            __m256i packed = _mm256_loadu_si256(reinterpret_cast<__m256i *>(&outBuffer[batchIdx]));
+            __m256 output1 = avxUnpack(_mm256_unpacklo_epi16(packed, _mm256_setzero_si256()));
+            __m256 output2 = avxUnpack(_mm256_unpackhi_epi16(packed, _mm256_setzero_si256()));
+            _mm256_storeu_ps(&(*out)[batchIdx], output1);
+            _mm256_storeu_ps(&(*out)[batchIdx + 8], output2);
         }
     }
 };
@@ -443,6 +497,7 @@ public:
     explicit EvaluateLab2XyzFasterStage(const cmsStage &base) : FasterStage(base) {}
 
     void evaluate(const std::vector<ChannelBatchBuffer> &input_buffer) override {
+        const cmsCIEXYZ* WhitePoint = cmsD50_XYZ();
         for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
             cmsCIELab Lab;
             cmsCIEXYZ XYZ;
@@ -453,7 +508,15 @@ public:
             Lab.a = input_buffer[1][batchIdx] * 255.0 - 128.0;
             Lab.b = input_buffer[2][batchIdx] * 255.0 - 128.0;
 
-            cmsLab2XYZ(NULL, &XYZ, &Lab);
+            cmsFloat64Number x, y, z;
+
+            y = (Lab.L + 16.0) / 116.0;
+            x = y + 0.002 * Lab.a;
+            z = y - 0.005 * Lab.b;
+
+            XYZ.X = f_1(x) * WhitePoint->X;
+            XYZ.Y = f_1(y) * WhitePoint->Y;
+            XYZ.Z = f_1(z) * WhitePoint->Z;
 
             // From XYZ, range 0..19997 to 0..1.0, note that 1.99997 comes from 0xffff
             // encoded as 1.15 fixed point, so 1 + (32767.0 / 32768.0)
@@ -461,6 +524,17 @@ public:
             output_buffer_[1][batchIdx] = (cmsFloat32Number) ((cmsFloat64Number) XYZ.Y / XYZadj);
             output_buffer_[2][batchIdx] = (cmsFloat32Number) ((cmsFloat64Number) XYZ.Z / XYZadj);
         }
+    }
+
+private:
+    static cmsFloat64Number f_1(cmsFloat64Number t) {
+        const cmsFloat64Number Limit = (24.0/116.0);
+
+        if (t <= Limit) {
+            return (108.0/841.0) * (t - (16.0/116.0));
+        }
+
+        return t * t * t;
     }
 };
 
