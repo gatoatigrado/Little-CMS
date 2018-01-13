@@ -85,7 +85,7 @@
 #if defined(_MSC_VER) || defined(__BORLANDC__)
 #   define cmsINLINE __inline
 #else
-#   define cmsINLINE static inline
+#   define cmsINLINE static inline __attribute__((always_inline))
 #endif
 
 // Other replacement functions
@@ -875,6 +875,17 @@ struct _cmsStage_struct {
     struct _cmsStage_struct* Next;
 };
 
+// For assembling a faster pipeline.
+void _LUTeval16(register const cmsUInt16Number In[], register cmsUInt16Number Out[],  register const void* D);
+void EvaluateLab2XYZ(const cmsFloat32Number In[],
+                     cmsFloat32Number Out[],
+                     const cmsStage *mpe);
+void EvaluateMatrix(const cmsFloat32Number In[],
+                    cmsFloat32Number Out[],
+                    const cmsStage *mpe);
+void EvaluateCurves(const cmsFloat32Number In[],
+                    cmsFloat32Number Out[],
+                    const cmsStage *mpe);
 
 // Special Stages (cannot be saved)
 CMSCHECKPOINT cmsStage*  CMSEXPORT _cmsStageAllocLab2XYZ(cmsContext ContextID);
