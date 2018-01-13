@@ -388,7 +388,10 @@ void NullXFORM(_cmsTRANSFORM* p,
 }
 
 constexpr size_t kFasterStageBatchSize = 128;
-using ChannelBatchBuffer = __attribute__((aligned(32))) float[kFasterStageBatchSize];
+
+// NOTE: GCC < 7 doesn't respect __attribute__((aligned(32)), so we don't assume storage is aligned.
+// Experiments with a manual aligned vector class didn't seem to have a performance benefit.
+using ChannelBatchBuffer = float[kFasterStageBatchSize];
 
 /** Basic API for faster stages */
 class FasterStage {
@@ -467,9 +470,7 @@ private:
         for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; batchIdx += 16) {
             __m256 input1 = avxSaturate(_mm256_loadu_ps(&in[batchIdx]));
             __m256 input2 = avxSaturate(_mm256_loadu_ps(&in[batchIdx + 8]));
-            __m256i packed = _mm256_packus_epi32(
-                    _mm256_cvtps_epi32(input1),
-                    _mm256_cvtps_epi32(input2));
+            __m256i packed = _mm256_packus_epi32(_mm256_cvtps_epi32(input1), _mm256_cvtps_epi32(input2));
             _mm256_storeu_si256(
                     reinterpret_cast<__m256i *>(&inBuffer[batchIdx]),
                     packed);
@@ -552,13 +553,39 @@ public:
         auto matrixData = reinterpret_cast<_cmsStageMatrixData*>(base_.Data);
         cmsFloat64Number Tmp;
 
-        // Input is already in 0..1.0 notation
-        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
-            for (i = 0; i < base_.OutputChannels; i++) {
+        if (base_.InputChannels == 3 && base_.OutputChannels == 3) {
+            evaluateSpecialized<3, 3>(input_buffer);
+        } else {
+            // Input is already in 0..1.0 notation
+            for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+                for (i = 0; i < base_.OutputChannels; i++) {
 
-                Tmp = 0;
-                for (j = 0; j < base_.InputChannels; j++) {
-                    Tmp += input_buffer[j][batchIdx] * matrixData->Double[i * base_.InputChannels + j];
+                    Tmp = 0;
+                    for (j = 0; j < base_.InputChannels; j++) {
+                        Tmp += input_buffer[j][batchIdx] * matrixData->Double[i * base_.InputChannels + j];
+                    }
+
+                    if (matrixData->Offset != NULL)
+                        Tmp += matrixData->Offset[i];
+
+                    output_buffer_[i][batchIdx] = (cmsFloat32Number) Tmp;
+                }
+            }
+            // Output in 0..1.0 domain
+        }
+    }
+
+private:
+    template <int InputChannels, int OutputChannels>
+    void __attribute__((noinline)) evaluateSpecialized(const std::vector<ChannelBatchBuffer> &input_buffer)  {
+        auto matrixData = reinterpret_cast<_cmsStageMatrixData*>(base_.Data);
+
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+            for (cmsUInt32Number i = 0; i < OutputChannels; i++) {
+
+                cmsFloat64Number Tmp = 0;
+                for (cmsUInt32Number j = 0; j < InputChannels; j++) {
+                    Tmp += input_buffer[j][batchIdx] * matrixData->Double[i * InputChannels + j];
                 }
 
                 if (matrixData->Offset != NULL)
@@ -567,7 +594,6 @@ public:
                 output_buffer_[i][batchIdx] = (cmsFloat32Number) Tmp;
             }
         }
-        // Output in 0..1.0 domain
     }
 };
 
