@@ -24,9 +24,17 @@
 //---------------------------------------------------------------------------------
 //
 
+#include <stdint.h>
+#include <vector>
+
+extern "C" {
+#include "lcms2.h"
 #include "lcms2_internal.h"
+}
 
 
+
+extern "C" {
 // Allocates an empty multi profile element
 cmsStage* CMSEXPORT _cmsStageAllocPlaceholder(cmsContext ContextID,
                                 cmsStageSignature Type,
@@ -163,8 +171,7 @@ cmsToneCurve** _cmsStageGetPtrToCurveSet(const cmsStage* mpe)
     return Data ->TheCurves;
 }
 
-static
-void EvaluateCurves(const cmsFloat32Number In[],
+void CMSEXPORT EvaluateCurves(const cmsFloat32Number In[],
                     cmsFloat32Number Out[],
                     const cmsStage *mpe)
 {
@@ -308,7 +315,6 @@ cmsStage* CMSEXPORT _cmsStageAllocIdentityCurves(cmsContext ContextID, cmsUInt32
 
 
 // Special care should be taken here because precision loss. A temporary cmsFloat64Number buffer is being used
-static
 void EvaluateMatrix(const cmsFloat32Number In[],
                     cmsFloat32Number Out[],
                     const cmsStage *mpe)
@@ -940,7 +946,6 @@ cmsInt32Number CMSEXPORT cmsSliceSpaceFloat(cmsUInt32Number nInputs, const cmsUI
 // ********************************************************************************
 
 
-static
 void EvaluateLab2XYZ(const cmsFloat32Number In[],
                      cmsFloat32Number Out[],
                      const cmsStage *mpe)
@@ -1316,7 +1321,6 @@ cmsBool BlessLUT(cmsPipeline* lut)
 
 
 // Default to evaluate the LUT on 16 bit-basis. Precision is retained.
-static
 void _LUTeval16(register const cmsUInt16Number In[], register cmsUInt16Number Out[],  register const void* D)
 {
     cmsPipeline* lut = (cmsPipeline*) D;
@@ -1338,8 +1342,6 @@ void _LUTeval16(register const cmsUInt16Number In[], register cmsUInt16Number Ou
 
     FromFloatTo16(&Storage[Phase][0], Out, lut ->OutputChannels);
 }
-
-
 
 // Does evaluate the LUT on cmsFloat32Number-basis.
 static
@@ -1839,5 +1841,5 @@ cmsBool CMSEXPORT cmsPipelineEvalReverseFloat(cmsFloat32Number Target[],
 
     return TRUE;
 }
-
+}
 

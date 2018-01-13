@@ -24,7 +24,16 @@
 //---------------------------------------------------------------------------------
 //
 
+#include <algorithm>
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <immintrin.h>
+#include <lcms2_plugin.h>
+
+extern "C" {
 #include "lcms2_internal.h"
+}
 
 // Transformations stuff
 // -----------------------------------------------------------------------
@@ -341,7 +350,7 @@ void NullFloatXFORM(_cmsTRANSFORM* p,
 
 // 16 bit precision -----------------------------------------------------------------------------------------------------------
 
-// Null transformation, only applies formatters. No caché
+// Null transformation, only applies formatters. No cache
 static
 void NullXFORM(_cmsTRANSFORM* p,
                const void* in,
@@ -378,6 +387,255 @@ void NullXFORM(_cmsTRANSFORM* p,
 
 }
 
+constexpr size_t kFasterStageBatchSize = 128;
+
+// NOTE: GCC < 7 doesn't respect __attribute__((aligned(32)), so we don't assume storage is aligned.
+// Experiments with a manual aligned vector class didn't seem to have a performance benefit.
+using ChannelBatchBuffer = float[kFasterStageBatchSize];
+
+/** Basic API for faster stages */
+class FasterStage {
+public:
+    explicit FasterStage(cmsStage base) : base_(base), output_buffer_(base.OutputChannels) {
+        for (size_t i = 0; i < base.OutputChannels; ++i) {
+            memset(output_buffer_[i], 0, kFasterStageBatchSize * sizeof(float));
+        }
+    }
+
+    // Method for subclasses to implement.
+    virtual void evaluate(const std::vector<ChannelBatchBuffer> &input_buffer) = 0;
+
+    size_t numInputChannels() const {
+        return base_.InputChannels;
+    }
+
+    size_t numOutputChannels() const {
+        return base_.OutputChannels;
+    }
+
+    std::vector<ChannelBatchBuffer> *outputBuffer() {
+        return &output_buffer_;
+    }
+
+protected:
+    cmsStage base_;
+    std::vector<ChannelBatchBuffer> output_buffer_;
+};
+
+class EvaluateCurvesFasterStage : public FasterStage {
+public:
+    explicit EvaluateCurvesFasterStage(const cmsStage &base) : FasterStage(base) {}
+
+    void evaluate(const std::vector<ChannelBatchBuffer> &input_buffer) override {
+        _cmsStageToneCurvesData *curvesData = reinterpret_cast<_cmsStageToneCurvesData *>(base_.Data);
+
+        if (curvesData == NULL) return;
+        if (curvesData->TheCurves == NULL) return;
+
+        for (size_t i = 0; i < curvesData->nCurves; i++) {
+            cmsToneCurve *const curve = curvesData->TheCurves[i];
+            _cmsAssert(curve != NULL);
+            const ChannelBatchBuffer &in = input_buffer[i];
+            ChannelBatchBuffer &out = output_buffer_[i];
+
+            if (curve->nSegments == 0) {
+                batchEvaluateLimitedPrecision(curve, in, &out);
+            } else {
+                for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+                    out[batchIdx] = cmsEvalToneCurveFloat(curve, in[batchIdx]);
+                }
+            }
+        }
+    }
+
+private:
+    static __m256 avxSaturate(register __m256 input) {
+        input = _mm256_set1_ps(65535.0) * input + _mm256_set1_ps(0.5);
+        return _mm256_floor_ps(
+                _mm256_min_ps(_mm256_set1_ps(665535.0),
+                              _mm256_max_ps(_mm256_set1_ps(0.0), input)));
+    }
+
+    static __m256 avxUnpack(register __m256i epi32_input) {
+        return _mm256_mul_ps( _mm256_set1_ps(1.0f / 65535.0f), _mm256_cvtepi32_ps(epi32_input));
+    }
+
+    void batchEvaluateLimitedPrecision(
+            const cmsToneCurve *curve, const ChannelBatchBuffer in,
+            ChannelBatchBuffer *out) const {
+        cmsUInt16Number inBuffer[kFasterStageBatchSize];
+        cmsUInt16Number outBuffer[kFasterStageBatchSize];
+
+        // Convert everything to uint16 using AVX.
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; batchIdx += 16) {
+            __m256 input1 = avxSaturate(_mm256_loadu_ps(&in[batchIdx]));
+            __m256 input2 = avxSaturate(_mm256_loadu_ps(&in[batchIdx + 8]));
+            __m256i packed = _mm256_packus_epi32(_mm256_cvtps_epi32(input1), _mm256_cvtps_epi32(input2));
+            _mm256_storeu_si256(
+                    reinterpret_cast<__m256i *>(&inBuffer[batchIdx]),
+                    packed);
+        }
+
+        _cmsInterpFn16 curveFcn = curve->InterpParams->Interpolation.Lerp16;
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+            // Check for 16 bits table. If so, this is a limited-precision tone curve
+            curveFcn(&inBuffer[batchIdx], &outBuffer[batchIdx], curve->InterpParams);
+        }
+
+        // Convert back to float using AVX.
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; batchIdx += 16) {
+            __m256i packed = _mm256_loadu_si256(reinterpret_cast<__m256i *>(&outBuffer[batchIdx]));
+            __m256 output1 = avxUnpack(_mm256_unpacklo_epi16(packed, _mm256_setzero_si256()));
+            __m256 output2 = avxUnpack(_mm256_unpackhi_epi16(packed, _mm256_setzero_si256()));
+            _mm256_storeu_ps(&(*out)[batchIdx], output1);
+            _mm256_storeu_ps(&(*out)[batchIdx + 8], output2);
+        }
+    }
+};
+
+class EvaluateLab2XyzFasterStage : public FasterStage {
+public:
+    explicit EvaluateLab2XyzFasterStage(const cmsStage &base) : FasterStage(base) {}
+
+    void evaluate(const std::vector<ChannelBatchBuffer> &input_buffer) override {
+        const cmsCIEXYZ* WhitePoint = cmsD50_XYZ();
+        const __m256 whitePointX = _mm256_set1_ps((float)(WhitePoint->X / MAX_ENCODEABLE_XYZ));
+        const __m256 whitePointY = _mm256_set1_ps((float)(WhitePoint->Y / MAX_ENCODEABLE_XYZ));
+        const __m256 whitePointZ = _mm256_set1_ps((float)(WhitePoint->Z / MAX_ENCODEABLE_XYZ));
+
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; batchIdx += 8) {
+            cmsCIELab Lab;
+            cmsCIEXYZ XYZ;
+
+            // V4 rules
+            __m256 L = _mm256_set1_ps(100.0) * _mm256_loadu_ps(&input_buffer[0][batchIdx]);
+            __m256 a = (
+                    _mm256_set1_ps(255) * _mm256_loadu_ps(&input_buffer[1][batchIdx]) -
+                    _mm256_set1_ps(128));
+            __m256 b = (
+                    _mm256_set1_ps(255) * _mm256_loadu_ps(&input_buffer[2][batchIdx])
+                    - _mm256_set1_ps(128));
+
+            __m256 y = (L + _mm256_set1_ps(16.0f)) * _mm256_set1_ps(1.0f/116.0f);
+            __m256 x = y + (_mm256_set1_ps(0.002f) * a);
+            __m256 z = y - (_mm256_set1_ps(0.005f) * b);
+
+            x = f_1(x) * whitePointX;
+            y = f_1(y) * whitePointY;
+            z = f_1(z) * whitePointZ;
+
+            // From XYZ, range 0..19997 to 0..1.0, note that 1.99997 comes from 0xffff
+            // encoded as 1.15 fixed point, so 1 + (32767.0 / 32768.0)
+            _mm256_storeu_ps(&output_buffer_[0][batchIdx], x);
+            _mm256_storeu_ps(&output_buffer_[1][batchIdx], y);
+            _mm256_storeu_ps(&output_buffer_[2][batchIdx], z);
+        }
+    }
+
+private:
+    static __m256 f_1(register __m256 t) {
+        constexpr float Limit = 24.0f / 116.0f;
+
+        __m256 result1 = _mm256_set1_ps(108.0f/841.0f) * (t - _mm256_set1_ps(16.0f/116.0f));
+        __m256 result2 = t * t * t;
+        __m256 switchVar = _mm256_cmp_ps(t, _mm256_set1_ps(Limit), _CMP_LE_OQ);
+        return _mm256_or_ps(
+                _mm256_and_ps(switchVar, result1),
+                _mm256_andnot_ps(switchVar, result2));
+    }
+};
+
+class EvaluateMatrixFasterStage : public FasterStage {
+public:
+    explicit EvaluateMatrixFasterStage(const cmsStage &base) : FasterStage(base) {}
+    void evaluate(const std::vector<ChannelBatchBuffer> &input_buffer) override {
+        cmsUInt32Number i, j;
+        auto matrixData = reinterpret_cast<_cmsStageMatrixData*>(base_.Data);
+        cmsFloat64Number Tmp;
+
+        if (base_.InputChannels == 3 && base_.OutputChannels == 3) {
+            evaluateSpecialized<3, 3>(input_buffer);
+        } else {
+            // Input is already in 0..1.0 notation
+            for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+                for (i = 0; i < base_.OutputChannels; i++) {
+
+                    Tmp = 0;
+                    for (j = 0; j < base_.InputChannels; j++) {
+                        Tmp += input_buffer[j][batchIdx] * matrixData->Double[i * base_.InputChannels + j];
+                    }
+
+                    if (matrixData->Offset != NULL)
+                        Tmp += matrixData->Offset[i];
+
+                    output_buffer_[i][batchIdx] = (cmsFloat32Number) Tmp;
+                }
+            }
+            // Output in 0..1.0 domain
+        }
+    }
+
+private:
+    template <int InputChannels, int OutputChannels>
+    void __attribute__((noinline)) evaluateSpecialized(const std::vector<ChannelBatchBuffer> &input_buffer)  {
+        auto matrixData = reinterpret_cast<_cmsStageMatrixData*>(base_.Data);
+
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+            for (cmsUInt32Number i = 0; i < OutputChannels; i++) {
+
+                cmsFloat64Number Tmp = 0;
+                for (cmsUInt32Number j = 0; j < InputChannels; j++) {
+                    Tmp += input_buffer[j][batchIdx] * matrixData->Double[i * InputChannels + j];
+                }
+
+                if (matrixData->Offset != NULL)
+                    Tmp += matrixData->Offset[i];
+
+                output_buffer_[i][batchIdx] = (cmsFloat32Number) Tmp;
+            }
+        }
+    }
+};
+
+/** Returns true if a faster pipeline could be assembled, false otherwise. */
+bool batchPipeline(
+        const _cmsOPTeval16Fn Eval16Fn,
+        void *data,
+        std::vector<std::unique_ptr<FasterStage>> *output) {
+    if (Eval16Fn == _LUTeval16) {
+        auto lut = reinterpret_cast<cmsPipeline*>(data);
+        std::vector<std::unique_ptr<FasterStage>> tempFasterPipeline;
+        for (cmsStage *mpe = lut->Elements; mpe != NULL; mpe = mpe->Next) {
+            if (mpe->EvalPtr == &EvaluateLab2XYZ) {
+                tempFasterPipeline.push_back(std::unique_ptr<FasterStage>(
+                        new EvaluateLab2XyzFasterStage(*mpe)
+                ));
+            } else if (mpe->EvalPtr == &EvaluateMatrix) {
+                tempFasterPipeline.push_back(std::unique_ptr<FasterStage>(
+                        new EvaluateMatrixFasterStage(*mpe)
+                ));
+            } else if (mpe->EvalPtr == &EvaluateCurves) {
+                tempFasterPipeline.push_back(std::unique_ptr<FasterStage>(
+                        new EvaluateCurvesFasterStage(*mpe)
+                ));
+            } else {
+                std::cout << "Failed to compile pipeline for stage "
+                          << reinterpret_cast<uintptr_t>(mpe) << "\n";
+                return false;
+            }
+        }
+        *output = std::move(tempFasterPipeline);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void runFasterPipeline(
+        const std::vector<std::unique_ptr<FasterStage>> &fasterPipeline
+) {
+    //...
+}
 
 // No gamut check, no cache, 16 bits
 static
@@ -391,7 +649,7 @@ void PrecalculatedXFORM(_cmsTRANSFORM* p,
     register cmsUInt8Number* accum;
     register cmsUInt8Number* output;
     cmsUInt16Number wIn[cmsMAXCHANNELS], wOut[cmsMAXCHANNELS];
-    cmsUInt32Number i, j, strideIn, strideOut;
+    cmsUInt32Number i, strideIn, strideOut;
 
     _cmsHandleExtraChannels(p, in, out, PixelsPerLine, LineCount, Stride);
 
@@ -400,22 +658,65 @@ void PrecalculatedXFORM(_cmsTRANSFORM* p,
     memset(wIn, 0, sizeof(wIn));
     memset(wOut, 0, sizeof(wOut));
 
-    for (i = 0; i < LineCount; i++) {
+    // Check if we can use the faster routine.
+    std::vector<std::unique_ptr<FasterStage>> fasterPipeline;
+    bool hasFasterPipeline = batchPipeline(p->Lut->Eval16Fn, p->Lut->Data, &fasterPipeline);
+    if (hasFasterPipeline && PixelsPerLine >= 32) {
+        const size_t numInputChannels = fasterPipeline[0]->numInputChannels();
+        const size_t numOutputChannels = fasterPipeline[0]->numOutputChannels();
+        std::vector<ChannelBatchBuffer> input_batch(numInputChannels);
 
-        accum = (cmsUInt8Number*)in + strideIn;
-        output = (cmsUInt8Number*)out + strideOut;
 
-        for (j = 0; j < PixelsPerLine; j++) {
+        for (i = 0; i < LineCount; i++) {
+            accum = (cmsUInt8Number *) in + strideIn;
+            output = (cmsUInt8Number *) out + strideOut;
 
-            accum = p->FromInput(p, wIn, accum, Stride->BytesPerPlaneIn);
-            p->Lut->Eval16Fn(wIn, wOut, p->Lut->Data);
-            output = p->ToOutput(p, wOut, output, Stride->BytesPerPlaneOut);
+            for (size_t jBatch = 0; jBatch < PixelsPerLine; jBatch += kFasterStageBatchSize) {
+                size_t numValid = std::min(PixelsPerLine - jBatch, kFasterStageBatchSize);
+
+                // Get input. TODO: Vectorize
+                for (int j = 0; j < numValid; ++j) {
+                    accum = p->FromInput(p, wIn, accum, Stride->BytesPerPlaneIn);
+                    for (int channel = 0; channel < numInputChannels; ++channel) {
+                        input_batch[channel][j] = static_cast<float>(wIn[channel]) / 65535.0f;
+                    }
+                }
+
+                // Run the pipeline
+                auto currStage = &input_batch;
+                for (auto &stage : fasterPipeline) {
+                    stage->evaluate(*currStage);
+                    currStage = stage->outputBuffer();
+                }
+
+                // Save the output. TODO: Vectorize
+                for (int j = 0; j < numValid; ++j) {
+                    for (int channel = 0; channel < numOutputChannels; ++channel) {
+                        wOut[channel] = _cmsQuickSaturateWord((*currStage)[channel][j] * 65535.0);
+                    }
+                    output = p->ToOutput(p, wOut, output, Stride->BytesPerPlaneOut);
+                }
+            }
+
+            strideIn += Stride->BytesPerLineIn;
+            strideOut += Stride->BytesPerLineOut;
         }
+    } else {
+        for (i = 0; i < LineCount; i++) {
 
-        strideIn += Stride->BytesPerLineIn;
-        strideOut += Stride->BytesPerLineOut;
+            accum = (cmsUInt8Number *) in + strideIn;
+            output = (cmsUInt8Number *) out + strideOut;
+
+            for (cmsUInt32Number j = 0; j < PixelsPerLine; j++) {
+                accum = p->FromInput(p, wIn, accum, Stride->BytesPerPlaneIn);
+                p->Lut->Eval16Fn(wIn, wOut, p->Lut->Data);
+                output = p->ToOutput(p, wOut, output, Stride->BytesPerPlaneOut);
+            }
+
+            strideIn += Stride->BytesPerLineIn;
+            strideOut += Stride->BytesPerLineOut;
+        }
     }
-
 }
 
 
@@ -442,7 +743,7 @@ void TransformOnePixelWithGamutCheck(_cmsTRANSFORM* p,
         p ->Lut ->Eval16Fn(wIn, wOut, p -> Lut->Data);
 }
 
-// Gamut check, No caché, 16 bits.
+// Gamut check, No cache, 16 bits.
 static
 void PrecalculatedXFORMGamutCheck(_cmsTRANSFORM* p,
                                   const void* in,
@@ -481,7 +782,7 @@ void PrecalculatedXFORMGamutCheck(_cmsTRANSFORM* p,
 }
 
 
-// No gamut check, Caché, 16 bits,
+// No gamut check, Cachï¿½, 16 bits,
 static
 void CachedXFORM(_cmsTRANSFORM* p,
                  const void* in,
@@ -839,7 +1140,7 @@ _cmsTRANSFORM* AllocEmptyTransform(cmsContext ContextID, cmsPipeline* lut,
             p ->xform = NullFloatXFORM;
         }
         else {
-            // Float transforms don't use caché, always are non-NULL
+            // Float transforms don't use cache, always are non-NULL
             p ->xform = FloatXFORM;
         }
 
@@ -878,16 +1179,16 @@ _cmsTRANSFORM* AllocEmptyTransform(cmsContext ContextID, cmsPipeline* lut,
             if (*dwFlags & cmsFLAGS_NOCACHE) {
 
                 if (*dwFlags & cmsFLAGS_GAMUTCHECK)
-                    p ->xform = PrecalculatedXFORMGamutCheck;  // Gamut check, no caché
+                    p ->xform = PrecalculatedXFORMGamutCheck;  // Gamut check, no cache
                 else
-                    p ->xform = PrecalculatedXFORM;  // No caché, no gamut check
+                    p ->xform = PrecalculatedXFORM;  // No cache, no gamut check
             }
             else {
 
                 if (*dwFlags & cmsFLAGS_GAMUTCHECK)
-                    p ->xform = CachedXFORMGamutCheck;    // Gamut check, caché
+                    p ->xform = CachedXFORMGamutCheck;    // Gamut check, cache
                 else
-                    p ->xform = CachedXFORM;  // No gamut check, caché
+                    p ->xform = CachedXFORM;  // No gamut check, cache
 
             }
         }
