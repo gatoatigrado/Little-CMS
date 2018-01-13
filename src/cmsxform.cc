@@ -498,43 +498,49 @@ public:
 
     void evaluate(const std::vector<ChannelBatchBuffer> &input_buffer) override {
         const cmsCIEXYZ* WhitePoint = cmsD50_XYZ();
-        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; ++batchIdx) {
+        const __m256 whitePointX = _mm256_set1_ps((float)(WhitePoint->X / MAX_ENCODEABLE_XYZ));
+        const __m256 whitePointY = _mm256_set1_ps((float)(WhitePoint->Y / MAX_ENCODEABLE_XYZ));
+        const __m256 whitePointZ = _mm256_set1_ps((float)(WhitePoint->Z / MAX_ENCODEABLE_XYZ));
+
+        for (size_t batchIdx = 0; batchIdx < kFasterStageBatchSize; batchIdx += 8) {
             cmsCIELab Lab;
             cmsCIEXYZ XYZ;
-            const cmsFloat64Number XYZadj = MAX_ENCODEABLE_XYZ;
 
             // V4 rules
-            Lab.L = input_buffer[0][batchIdx] * 100.0;
-            Lab.a = input_buffer[1][batchIdx] * 255.0 - 128.0;
-            Lab.b = input_buffer[2][batchIdx] * 255.0 - 128.0;
+            __m256 L = _mm256_set1_ps(100.0) * _mm256_loadu_ps(&input_buffer[0][batchIdx]);
+            __m256 a = (
+                    _mm256_set1_ps(255) * _mm256_loadu_ps(&input_buffer[1][batchIdx]) -
+                    _mm256_set1_ps(128));
+            __m256 b = (
+                    _mm256_set1_ps(255) * _mm256_loadu_ps(&input_buffer[2][batchIdx])
+                    - _mm256_set1_ps(128));
 
-            cmsFloat64Number x, y, z;
+            __m256 y = (L + _mm256_set1_ps(16.0f)) * _mm256_set1_ps(1.0f/116.0f);
+            __m256 x = y + (_mm256_set1_ps(0.002f) * a);
+            __m256 z = y - (_mm256_set1_ps(0.005f) * b);
 
-            y = (Lab.L + 16.0) / 116.0;
-            x = y + 0.002 * Lab.a;
-            z = y - 0.005 * Lab.b;
-
-            XYZ.X = f_1(x) * WhitePoint->X;
-            XYZ.Y = f_1(y) * WhitePoint->Y;
-            XYZ.Z = f_1(z) * WhitePoint->Z;
+            x = f_1(x) * whitePointX;
+            y = f_1(y) * whitePointY;
+            z = f_1(z) * whitePointZ;
 
             // From XYZ, range 0..19997 to 0..1.0, note that 1.99997 comes from 0xffff
             // encoded as 1.15 fixed point, so 1 + (32767.0 / 32768.0)
-            output_buffer_[0][batchIdx] = (cmsFloat32Number) ((cmsFloat64Number) XYZ.X / XYZadj);
-            output_buffer_[1][batchIdx] = (cmsFloat32Number) ((cmsFloat64Number) XYZ.Y / XYZadj);
-            output_buffer_[2][batchIdx] = (cmsFloat32Number) ((cmsFloat64Number) XYZ.Z / XYZadj);
+            _mm256_storeu_ps(&output_buffer_[0][batchIdx], x);
+            _mm256_storeu_ps(&output_buffer_[1][batchIdx], y);
+            _mm256_storeu_ps(&output_buffer_[2][batchIdx], z);
         }
     }
 
 private:
-    static cmsFloat64Number f_1(cmsFloat64Number t) {
-        const cmsFloat64Number Limit = (24.0/116.0);
+    static __m256 f_1(register __m256 t) {
+        constexpr float Limit = 24.0f / 116.0f;
 
-        if (t <= Limit) {
-            return (108.0/841.0) * (t - (16.0/116.0));
-        }
-
-        return t * t * t;
+        __m256 result1 = _mm256_set1_ps(108.0f/841.0f) * (t - _mm256_set1_ps(16.0f/116.0f));
+        __m256 result2 = t * t * t;
+        __m256 switchVar = _mm256_cmp_ps(t, _mm256_set1_ps(Limit), _CMP_LE_OQ);
+        return _mm256_or_ps(
+                _mm256_and_ps(switchVar, result1),
+                _mm256_andnot_ps(switchVar, result2));
     }
 };
 
